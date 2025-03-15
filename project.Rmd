@@ -550,9 +550,6 @@ summary_stats2 <- data.frame(
   )
 
 summary_stats2
-
-write.csv(results2, "/Users/alenazeng/Documents/UChicago/Class/ECON/ECMA 31330/nonlinear_results.csv")
-write.csv(summary_stats2, "/Users/alenazeng/Documents/UChicago/Class/ECON/ECMA 31330/nonlinear_summary.csv")
 ```
 
 
