@@ -25,7 +25,7 @@ library(dplyr)
 # Setup and cleaning
 
 ```{r}
-indiv <- read.dta("p00use_mf_indiv.dta")
+indiv <- read.dta("data/p00use_mf_indiv.dta")
 indiv <- indiv[!is.na(indiv$eng), ]
 
 # create instrument
