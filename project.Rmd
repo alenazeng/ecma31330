@@ -1,0 +1,618 @@
+---
+title: "ECMA 31330 Project"
+output: pdf_document
+date: "2025-03-14"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggplot2)
+library(readxl)
+library(missMethods)
+library(glmnet)
+library(haven)
+library(AER)
+library(DoubleML)
+library(foreign)
+library(mlr3)
+library(mlr3learners)
+library(data.table)
+library(grf)
+library(broom)
+library(dplyr)
+```
+
+# Setup and cleaning
+
+```{r}
+indiv <- read.dta("p00use_mf_indiv.dta")
+indiv <- indiv[!is.na(indiv$eng), ]
+
+# create instrument
+indiv$pwlinear <- ifelse(indiv$agearr - 9 <= 0, 0, 1)
+indiv$idvar = indiv$pwlinear*indiv$nengdom # instrument
+for (i in 0:14) {
+  indiv[[paste0("agearr", i)]] <- as.integer(indiv$agearr == i)
+}
+# create binary treatment
+indiv$eng_binary <- ifelse(indiv$eng >= 2, 1, 0)
+```
+
+# IV for economic outcomes
+
+## First stage coefficients
+
+```{r}
+incwagereg_1st <- lm(eng_binary ~ idvar + agearr1 + agearr2 + agearr3 + agearr4 + agearr5 + agearr6 + agearr7 + agearr8 + agearr9 + agearr10 + agearr11 + agearr12 + agearr13 + agearr14 + as.factor(age) + female + black + asianpi + other + multi + hispdum + as.factor(bpld), data=indiv)
+
+summary(incwagereg_1st)
+```
+
+```{r}
+incwagereg <- ivreg(incwage ~ eng + agearr1 + agearr2 + agearr3 + agearr4 + agearr5 + agearr6 + agearr7 + agearr8 + agearr9 + agearr10 + agearr11 + agearr12 + agearr13 + agearr14 + as.factor(age) + female + black + asianpi + other + multi + hispdum + as.factor(bpld) | idvar + agearr1 + agearr2 + agearr3 + agearr4 + agearr5 + agearr6 + agearr7 + agearr8 + agearr9 + agearr10 + agearr11 + agearr12 + agearr13 + agearr14 + as.factor(age) + female + black + asianpi + other + multi + hispdum + as.factor(bpld), data=indiv)
+
+summary(incwagereg)
+```
+
+## Binary IV
+
+```{r}
+incwagereg_binary <- ivreg(incwage ~ eng_binary + agearr1 + agearr2 + agearr3 + agearr4 + agearr5 + agearr6 + agearr7 + agearr8 + agearr9 + agearr10 + agearr11 + agearr12 + agearr13 + agearr14 + as.factor(age) + female + black + asianpi + other + multi + hispdum + as.factor(bpld) | idvar + agearr1 + agearr2 + agearr3 + agearr4 + agearr5 + agearr6 + agearr7 + agearr8 + agearr9 + agearr10 + agearr11 + agearr12 + agearr13 + agearr14 + as.factor(age) + female + black + asianpi + other + multi + hispdum + as.factor(bpld), data=indiv)
+
+summary(incwagereg_binary)
+```
+
+```{r}
+ggplot(indiv, aes(x = as.factor(eng_binary))) +
+  geom_bar() +
+  labs(title = "Distribution of Binary Treatment (eng_binary)",
+       x = "Treatment (eng_binary)",
+       y = "Count",
+       fill = "Treatment") +
+  theme_minimal()
+```
+
+```{r}
+ols_model <- lm(incwage ~ eng_binary + agearr1 + agearr2 + agearr3 + agearr4 + agearr5 + agearr6 + agearr7 + agearr8 + agearr9 + agearr10 + agearr11 + agearr12 + agearr13 + agearr14 + as.factor(age) + female + black + asianpi + other + multi + hispdum + as.factor(bpld), data = indiv)
+ols_coef <- tidy(ols_model) %>% filter(term == "eng_binary")
+
+iv_model <- ivreg(incwage ~ eng_binary + agearr1 + agearr2 + agearr3 + agearr4 + agearr5 + agearr6 + agearr7 + agearr8 + agearr9 + agearr10 + agearr11 + agearr12 + agearr13 + agearr14 + as.factor(age) + female + black + asianpi + other + multi + hispdum + as.factor(bpld) | idvar + agearr1 + agearr2 + agearr3 + agearr4 + agearr5 + agearr6 + agearr7 + agearr8 + agearr9 + agearr10 + agearr11 + agearr12 + agearr13 + agearr14 + as.factor(age) + female + black + asianpi + other + multi + hispdum + as.factor(bpld), data = indiv)
+
+iv_coef <- tidy(iv_model) %>% filter(term == "eng_binary")
+
+ci_plot_data <- data.frame(
+  Method = c("OLS", "IV"),
+  Estimate = c(ols_coef$estimate, iv_coef$estimate),
+  Lower = c(ols_coef$estimate - 1.96 * ols_coef$std.error, iv_coef$estimate - 1.96 * iv_coef$std.error),
+  Upper = c(ols_coef$estimate + 1.96 * ols_coef$std.error, iv_coef$estimate + 1.96 * iv_coef$std.error)
+)
+
+ggplot(ci_plot_data, aes(x = Method, y = Estimate)) +
+  geom_point(size = 3, color = "black") +
+  geom_errorbar(aes(ymin = Lower, ymax = Upper), width = 0.2, color = "black") +
+  labs(title = "Comparison of OLS vs IV Estimates",
+       y = "Coefficient Estimate for Treatment (eng)") +
+  theme_minimal()
+```
+
+# SIMULATION
+
+## DGP 1
+
+```{r}
+set.seed(123)
+simulate_ml_iv_cate <- function(n = 10000) {
+  
+  ##### COVARIATES (distributions similar to true dataset)
+  female <- rbinom(n, 1, 0.5) 
+  black <- rbinom(n, 1, 0.05)  
+  hispdum <- rbinom(n, 1, 0.45)
+  asianpi <- rbinom(n, 1, 0.11)
+  other <- rbinom(n, 1, 0.22)
+  multi <- rbinom(n, 1, 0.05)
+  bpld_fractions <- prop.table(table(indiv$bpld))[-1]
+  bpld_levels <- factor(sample(names(bpld_fractions), n, replace = TRUE, 
+                        prob = bpld_fractions))
+  
+  age_fractions <- prop.table(table(indiv$age))[-1]
+  age_levels <- factor(sample(names(age_fractions), n, replace = TRUE, 
+                        prob = age_fractions))
+  age <- as.numeric(as.character(age_levels))
+  agearr <- sample(0:14, n, replace = TRUE)
+  
+  # age-at-arrival dummies matrix
+  agearr_matrix <- sapply(1:14, function(year) ifelse(agearr == year, 1, 0))
+  colnames(agearr_matrix) <- paste0("agearr", 1:14)
+
+  # instrument
+  pwlinear <- ifelse(agearr - 9 <= 0, 0, 1)
+  nengdom <- rbinom(n, 1, 0.865)
+  idvar <- pwlinear * nengdom
+  
+  # unobserved confounders
+  U <- rnorm(n, mean=0, sd=36000)
+  V <- rnorm(n, mean=0, sd=0.22)
+
+  # treatment
+  bpld_1st_stage <- incwagereg_1st$coefficients[53:219]
+  age_1st_stage <- incwagereg_1st$coefficients[17:46]
+  
+  D <- -0.092 * idvar + 
+    agearr_matrix %*% c(0.0001594819, -0.0008821329, -0.0010304124, -0.0014103131, -0.0082702500, -0.0104773137, -0.0129752199, -0.0210304694, -0.0262801743, 0.0360069970, 0.0249503824, -0.0003054720, -0.0391060496, -0.0684170229) +
+    as.numeric(sapply(bpld_levels, function(b) 
+      bpld_1st_stage[paste0("as.factor(bpld)", b)])) + 
+    as.numeric(sapply(age_levels, function(b) 
+      age_1st_stage[paste0("as.factor(age)", b)])) + V
+  D_threshold <- quantile(D, 0.10) 
+  D <- ifelse(D > D_threshold, 1, 0)
+
+  # heterogeneous treatment effect varies by X
+  bpld_15000 <- as.numeric(bpld_levels == "15000")
+  bpld_20000 <- as.numeric(bpld_levels == "2000")
+  beta_1 <- 1.4 * (0.3 * (age > 40) - female*age - 0.1 * female + 
+    0.5 * age^3 + 0.5 * bpld_15000 - 0.3 * bpld_20000 + 0.2 * black + 
+    0.4 * hispdum + 0.3 * asianpi^2 - 0.3 * bpld_20000 * female)
+
+  bpld_coeffs <- incwagereg_binary$coefficients[52:219]
+  age_coeffs <- incwagereg_binary$coefficients[17:46]
+  
+  Y <- -14000 + beta_1 * D - 15674.59 * female - 1896.49 * black + 3579.08 * asianpi - 2077.82 * other - 3232.33 * multi - 4174.22 * hispdum + 
+    agearr_matrix %*% c(-137.6537, 433.0189, 238.4158, 934.0018, 332.7407, 348.5305, -182.1286, -696.3773, -1170.2311, -932.6942, -1218.1713, -666.9265, 505.8028, 1372.6309) +
+    as.numeric(sapply(bpld_levels, function(b) 
+      bpld_coeffs[paste0("as.factor(bpld)", b)])) + 
+    as.numeric(sapply(age_levels, function(b) 
+      age_coeffs[paste0("as.factor(age)", b)])) +
+    U
+  Y <- pmax(Y, 0)
+
+  # convert agearr matrix into data.table format
+  df <- data.table(Y = Y, D = D, Z = idvar, age = age, female = female,
+                   black = black, hispdum = hispdum, asianpi = asianpi, 
+                   other = other, multi = multi, bpld = bpld_levels, 
+                   beta_1 = beta_1)  
+  
+  # add agearr dummies to df
+  df <- cbind(df, as.data.table(agearr_matrix))
+
+  return(df)
+}
+
+df <- simulate_ml_iv_cate(n = 100000)
+summary(df)
+```
+
+## DGP 2
+
+```{r}
+library(data.table)
+set.seed(123)
+
+simulate_ml_iv_cate2 <- function(n = 10000) {
+  
+  ##### COVARIATES (distributions similar to true dataset)
+  female <- rbinom(n, 1, 0.5) 
+  black <- rbinom(n, 1, 0.05)  
+  hispdum <- rbinom(n, 1, 0.45)
+  asianpi <- rbinom(n, 1, 0.11)
+  other <- rbinom(n, 1, 0.22)
+  multi <- rbinom(n, 1, 0.05)
+  bpld_fractions <- prop.table(table(indiv$bpld))[-1]
+  bpld_levels <- factor(sample(names(bpld_fractions), n, replace = TRUE, 
+                        prob = bpld_fractions))
+  
+  age_fractions <- prop.table(table(indiv$age))[-1]
+  age_levels <- factor(sample(names(age_fractions), n, replace = TRUE, 
+                        prob = age_fractions))
+  age <- as.numeric(as.character(age_levels))
+  agearr <- sample(0:14, n, replace = TRUE)
+  
+  # age-at-arrival dummies matrix
+  agearr_matrix <- sapply(1:14, function(year) ifelse(agearr == year, 1, 0))
+  colnames(agearr_matrix) <- paste0("agearr", 1:14)
+
+  # instrument
+  pwlinear <- ifelse(agearr - 9 <= 0, 0, 1)
+  nengdom <- rbinom(n, 1, 0.865)
+  idvar <- pwlinear * nengdom
+  
+  # unobserved confounders
+  U <- rnorm(n, mean=0, sd=36000)
+  V <- rnorm(n, mean=0, sd=0.22)
+
+  # treatment
+  bpld_1st_stage <- incwagereg_1st$coefficients[53:219]
+  age_1st_stage <- incwagereg_1st$coefficients[17:46]
+  D <- -0.092 * idvar + 
+    agearr_matrix %*% c(0.0001594819, -0.0008821329, -0.0010304124, -0.0014103131, -0.0082702500, -0.0104773137, -0.0129752199, -0.0210304694, -0.0262801743, 0.0360069970, 0.0249503824, -0.0003054720, -0.0391060496, -0.0684170229) +
+    as.numeric(sapply(bpld_levels, function(b) 
+      bpld_1st_stage[paste0("as.factor(bpld)", b)])) + 
+    as.numeric(sapply(age_levels, function(b) 
+      age_1st_stage[paste0("as.factor(age)", b)])) + V
+
+  D_threshold <- quantile(D, 0.10) 
+  D <- ifelse(D > D_threshold, 1, 0)
+
+  # heterogeneous treatment effect varies by X
+  bpld_15000 <- as.numeric(bpld_levels == "15000")
+  bpld_20000 <- as.numeric(bpld_levels == "2000")
+  beta_1 <- 0.6 * (5 * sin(age) + 4 * exp(bpld_15000 * sqrt(age)) - 
+                     0.4 * female + log(1 + bpld_15000) + 0.2 * black 
+                   + 0.3 * asianpi + age^3)
+  bpld_coeffs <- incwagereg_binary$coefficients[52:219]
+  age_coeffs <- incwagereg_binary$coefficients[17:46]
+  
+  Y <- -14000 + beta_1 * D - 15674.59 * female - 1896.49 * black + 3579.08 * asianpi - 2077.82 * other - 3232.33 * multi - 4174.22 * hispdum + 
+    agearr_matrix %*% c(-137.6537, 433.0189, 238.4158, 934.0018, 332.7407, 348.5305, -182.1286, -696.3773, -1170.2311, -932.6942, -1218.1713, -666.9265, 505.8028, 1372.6309) +
+    as.numeric(sapply(bpld_levels, function(b) 
+      bpld_coeffs[paste0("as.factor(bpld)", b)])) + 
+    as.numeric(sapply(age_levels, function(b) 
+      age_coeffs[paste0("as.factor(age)", b)])) +
+    U
+  Y <- pmax(Y, 0)
+  
+  # convert agearr matrix into data.table format
+  df <- data.table(Y = Y, D = D, Z = idvar, age = age, female = female,
+                   black = black, hispdum = hispdum, asianpi = asianpi, 
+                   other = other, multi = multi, bpld = bpld_levels, 
+                   beta_1 = beta_1)  
+  
+  # add agearr dummies to df
+  df <- cbind(df, as.data.table(agearr_matrix))
+
+  return(df)
+}
+
+df2 <- simulate_ml_iv_cate2(n = 100000)
+summary(df2)
+```
+
+## Hyperparameter tuning
+
+### Instrumental Forest
+
+```{r}
+set.seed(123)
+ntree_values <- c(50, 100, 500, 2000)
+test_df <- simulate_ml_iv_cate(n = 100000)
+ate_estimates <- numeric(length(ntree_values))
+ate_se <- numeric(length(ntree_values))
+
+for (i in seq_along(ntree_values)){
+  ntree_val <- ntree_values[i]
+  cat("Fitting instrumental forest with", ntree_val, "trees...\n")
+  test_df <- test_df[complete.cases(test_df), ]
+  
+  X <- model.matrix(~ agearr1 + agearr2 + agearr3 + agearr4 + agearr5 + agearr6 + agearr7 + agearr8 + agearr9 + agearr10 + agearr11 + agearr12 + agearr13 + agearr14 + as.factor(age) + female + black + asianpi + other + multi + hispdum + as.factor(bpld), data=test_df)
+  W <- as.numeric(test_df$D)
+  Z <- as.numeric(test_df$Z)
+  Y <- as.numeric(test_df$Y.V1)
+
+  forest_model <- instrumental_forest(
+  X, Y, W, Z, num.trees = ntree_val)
+
+  ate_result <- average_treatment_effect(forest_model)
+  ate_estimates[i] <- ate_result[1]
+  ate_se[i] <- ate_result[2]
+  
+  cat("NTrees:", ntree_val, "- ATE:", round(ate_result[1], 3), 
+      "SE:", round(ate_result[2], 3), "\n")
+}
+
+tuning_results <- data.frame(
+    Trees = ntree_values,
+    ATE_Estimate = ate_estimates,
+    Standard_Error = ate_se)
+```
+
+```{r}
+ntree_values <- c(250, 500, 1000)
+ate_estimates <- numeric(length(ntree_values))
+ate_se <- numeric(length(ntree_values))
+
+for (i in seq_along(ntree_values)){
+  ntree_val <- ntree_values[i]
+  cat("Fitting instrumental forest with", ntree_val, "trees...\n")
+  test_df <- test_df[complete.cases(test_df), ]
+  
+  X <- model.matrix(~ agearr1 + agearr2 + agearr3 + agearr4 + agearr5 + agearr6 + agearr7 + agearr8 + agearr9 + agearr10 + agearr11 + agearr12 + agearr13 + agearr14 + as.factor(age) + female + black + asianpi + other + multi + hispdum + as.factor(bpld), data=test_df)
+  W <- as.numeric(test_df$D)
+  Z <- as.numeric(test_df$Z)
+  Y <- as.numeric(test_df$Y.V1)
+
+  forest_model <- instrumental_forest(
+  X, Y, W, Z, num.trees = ntree_val)
+
+  ate_result <- average_treatment_effect(forest_model)
+  ate_estimates[i] <- ate_result[1]
+  ate_se[i] <- ate_result[2]
+  
+  cat("NTrees:", ntree_val, "- ATE:", round(ate_result[1], 3), 
+      "SE:", round(ate_result[2], 3), "\n")
+}
+
+tuning_results2 <- data.frame(
+    Trees = ntree_values,
+    ATE_Estimate = ate_estimates,
+    Standard_Error = ate_se)
+```
+
+### DML-IIVM
+
+```{r}
+set.seed(123)
+ntree_values <- c(50, 100, 250, 500, 1000, 2000)
+ate_estimates <- numeric(length(ntree_values))
+ate_se <- numeric(length(ntree_values))
+
+for (i in seq_along(ntree_values)){
+  ntree_val <- ntree_values[i]
+  cat("Fitting DML-IV with", ntree_val, "trees...\n")
+  test_df <- test_df[complete.cases(test_df), ]
+  
+  x_cols = c("female", "black", "hispdum", "asianpi", "other", "multi", 
+  "agearr1", "agearr2", "agearr3", "agearr4", "agearr5", "agearr6", 
+  "agearr7", "agearr8", "agearr9", "agearr10", "agearr11", "agearr12", 
+  "agearr13", "agearr14")
+  df[, age := as.factor(age)]
+  df[, bpld := as.factor(bpld)]
+  x_cols <- c(x_cols, "age", "bpld")
+
+  obj_dml_data <- DoubleMLData$new(df, y_col = "Y.V1", d_cols = "D.V1", z_cols = "Z", 
+                                   x_cols = x_cols)
+  ml_g <- lrn("regr.ranger", num.trees = ntree_val)
+  ml_m <- lrn("classif.ranger", num.trees = ntree_val)
+  ml_r <- ml_m$clone()
+  dml_iivm_obj <- DoubleMLIIVM$new(obj_dml_data, ml_g, ml_m, ml_r)
+  dml_iivm_obj$fit()
+
+  ate_result <- dml_iivm_obj$coef["D.V1"]
+  ate_estimates[i] <- ate_result
+  ate_se[i] <- dml_iivm_obj$se
+  
+  cat("NTrees:", ntree_val, "- ATE:", round(ate_result, 3), 
+      "SE:", round(ate_se[i], 3), "\n")
+}
+
+tuning_results3 <- data.frame(
+    Trees = ntree_values,
+    ATE_Estimate = ate_estimates,
+    Standard_Error = ate_se)
+
+tuning_results3
+```
+
+## Simulation: DGP 1
+
+```{r}
+set.seed(123)
+
+# Number of simulations
+n_sim <- 50
+
+# Store results
+results <- data.frame(
+  dml_ate = numeric(n_sim),
+  dml_se = numeric(n_sim),
+  ivforest_ate = numeric(n_sim),
+  ivforest_se = numeric(n_sim),
+  tsls_ate = numeric(n_sim),
+  tsls_se = numeric(n_sim),
+  true_ate = numeric(n_sim)
+)
+df_all <- data.table()
+
+for (i in 1:n_sim) {
+  cat("sim #", i, "\n")
+  df <- simulate_ml_iv_cate(n = 100000)
+  df[, sim_id := i] 
+  df_all <- rbind(df_all, df, fill = TRUE)
+  
+  # true beta_1 for current simulation
+  true_ate <- mean(df$beta_1)
+  
+  ##### DML-IV
+  x_cols = c("female", "black", "hispdum", "asianpi", "other", "multi", 
+  "agearr1", "agearr2", "agearr3", "agearr4", "agearr5", "agearr6", 
+  "agearr7", "agearr8", "agearr9", "agearr10", "agearr11", "agearr12", 
+  "agearr13", "agearr14")
+  df[, age := as.factor(age)]
+  df[, bpld := as.factor(bpld)]
+  x_cols <- c(x_cols, "age", "bpld")
+  obj_dml_data <- DoubleMLData$new(df, y_col = "Y.V1", d_cols = "D.V1", 
+                                   z_cols = "Z", x_cols = x_cols)
+  ml_g <- lrn("regr.ranger", num.trees = 250)
+  ml_m <- lrn("classif.ranger", num.trees = 250)
+  ml_r <- ml_m$clone()
+  dml_iivm_obj <- DoubleMLIIVM$new(obj_dml_data, ml_g, ml_m, ml_r)
+  dml_iivm_obj$fit()
+  dml_ate <- dml_iivm_obj$coef["D.V1"]
+  dml_se = dml_iivm_obj$se["D.V1"]
+
+  ##### IV Forest
+  X <- model.matrix(~ agearr1 + agearr2 + agearr3 + agearr4 + agearr5 + agearr6 + agearr7 + agearr8 + agearr9 + agearr10 + agearr11 + agearr12 + agearr13 + agearr14 + as.factor(age) + female + black + asianpi + other + multi + hispdum + as.factor(bpld), data=df)
+  W <- as.numeric(df$D.V1)
+  Z <- as.numeric(df$Z)
+  Y <- as.numeric(df$Y.V1)
+  
+  incwage_ivforest <- instrumental_forest(
+    X, Y, W, Z, num.trees = 250
+  )
+  ate_result <- average_treatment_effect(incwage_ivforest)
+  ivforest_ate <- ate_result[1]
+  ivforest_se <- ate_result[2]
+
+  ##### 2SLS regression
+  iv_reg <- ivreg(Y.V1 ~ D.V1 + agearr1 + agearr2 + agearr3 + agearr4 + agearr5 + agearr6 + agearr7 + agearr8 + agearr9 + agearr10 + agearr11 + agearr12 + agearr13 + agearr14 + as.factor(age) + female + black + asianpi + other + multi + hispdum + as.factor(bpld) | Z + agearr1 + agearr2 + agearr3 + agearr4 + agearr5 + agearr6 + agearr7 + agearr8 + agearr9 + agearr10 + agearr11 + agearr12 + agearr13 + agearr14 + as.factor(age) + female + black + asianpi + other + multi + hispdum + as.factor(bpld), data=df)
+  
+  tsls_result <- coef(summary(iv_reg))
+  tsls_ate <- tsls_result["D.V1", "Estimate"]
+  tsls_se <- tsls_result["D.V1", "Std. Error"]
+  
+  ##### store all results
+  results[i, ] <- c(dml_ate, dml_se, ivforest_ate, 
+                    ivforest_se, tsls_ate, tsls_se, true_ate) 
+  print(results[i, ])
+
+}
+```
+
+```{r}
+results <- results[c(1:29, 31:50),]
+summary_stats <- data.frame(
+  bias = colMeans(results[, c(1,3,5)] - results$true_ate),
+  mse = apply((results[, c(1,3,5)] - results$true_ate)^2, 2, mean, na.rm = TRUE)
+)
+summary_stats
+```
+
+
+## Simulation: DGP 2
+
+```{r}
+set.seed(123)
+
+# Number of simulations
+n_sim <- 50 
+
+# Store results
+results2 <- data.frame(
+  dml_ate = numeric(n_sim),
+  dml_se = numeric(n_sim),
+  ivforest_ate = numeric(n_sim),
+  ivforest_se = numeric(n_sim),
+  tsls_ate = numeric(n_sim),
+  tsls_se = numeric(n_sim),
+  true_ate = numeric(n_sim)
+)
+df_all2 <- data.table()
+
+for (i in 1:n_sim) {
+  cat("sim #", i, "\n")
+  df <- simulate_ml_iv_cate2(n = 100000)
+  df[, sim_id := i] 
+  df_all2 <- rbind(df_all2, df, fill = TRUE)
+  
+  # true beta_1 for current simulation
+  true_ate <- mean(df$beta_1)
+  
+  ##### DML-IV
+  x_cols = c("female", "black", "hispdum", "asianpi", "other", "multi", 
+  "agearr1", "agearr2", "agearr3", "agearr4", "agearr5", "agearr6", 
+  "agearr7", "agearr8", "agearr9", "agearr10", "agearr11", "agearr12", 
+  "agearr13", "agearr14")
+  df[, age := as.factor(age)]
+  df[, bpld := as.factor(bpld)]
+  x_cols <- c(x_cols, "age", "bpld")
+  obj_dml_data <- DoubleMLData$new(df, y_col = "Y.V1", d_cols = "D.V1", 
+                                   z_cols = "Z", x_cols = x_cols)
+  ml_g <- lrn("regr.ranger", num.trees = 250)
+  ml_m <- lrn("classif.ranger", num.trees = 250)
+  ml_r <- ml_m$clone()
+  dml_iivm_obj <- DoubleMLIIVM$new(obj_dml_data, ml_g, ml_m, ml_r)
+  dml_iivm_obj$fit()
+  dml_ate <- dml_iivm_obj$coef["D.V1"]
+  dml_se = dml_iivm_obj$se["D.V1"]
+
+  ##### IV Forest
+  X <- model.matrix(~ agearr1 + agearr2 + agearr3 + agearr4 + agearr5 + agearr6 + agearr7 + agearr8 + agearr9 + agearr10 + agearr11 + agearr12 + agearr13 + agearr14 + as.factor(age) + female + black + asianpi + other + multi + hispdum + as.factor(bpld), data=df)
+  W <- as.numeric(df$D.V1)
+  Z <- as.numeric(df$Z)
+  Y <- as.numeric(df$Y.V1)
+  
+  incwage_ivforest <- instrumental_forest(
+    X, Y, W, Z, num.trees = 250
+  )
+  ate_result <- average_treatment_effect(incwage_ivforest)
+  ivforest_ate <- ate_result[1]
+  ivforest_se <- ate_result[2]
+
+  ##### 2SLS regression
+  iv_reg <- ivreg(Y.V1 ~ D.V1 + agearr1 + agearr2 + agearr3 + agearr4 + agearr5 + agearr6 + agearr7 + agearr8 + agearr9 + agearr10 + agearr11 + agearr12 + agearr13 + agearr14 + as.factor(age) + female + black + asianpi + other + multi + hispdum + as.factor(bpld) | Z + agearr1 + agearr2 + agearr3 + agearr4 + agearr5 + agearr6 + agearr7 + agearr8 + agearr9 + agearr10 + agearr11 + agearr12 + agearr13 + agearr14 + as.factor(age) + female + black + asianpi + other + multi + hispdum + as.factor(bpld), data=df)
+  
+  tsls_result <- coef(summary(iv_reg))
+  tsls_ate <- tsls_result["D.V1", "Estimate"]
+  tsls_se <- tsls_result["D.V1", "Std. Error"]
+  
+  ##### store all results
+  results2[i, ] <- c(dml_ate, dml_se, ivforest_ate, 
+                    ivforest_se, tsls_ate, tsls_se, true_ate) 
+  print(results2[i, ])
+}
+```
+
+```{r}
+results_temp <- results2[c(1:29, 31, 32, 34:50), ]
+
+summary_stats2 <- data.frame(
+  bias = colMeans(results_temp[, c(1,3,5)] - results_temp$true_ate),
+  mse = apply((results_temp[, c(1,3,5)] - results_temp$true_ate)^2, 2, 
+              mean, na.rm = TRUE)
+  )
+
+summary_stats2
+
+write.csv(results2, "/Users/alenazeng/Documents/UChicago/Class/ECON/ECMA 31330/nonlinear_results.csv")
+write.csv(summary_stats2, "/Users/alenazeng/Documents/UChicago/Class/ECON/ECMA 31330/nonlinear_summary.csv")
+```
+
+
+# REAL DATA
+
+## IV
+
+```{r}
+summary(incwagereg_binary)
+```
+
+## Instrumental Forest
+
+```{r}
+set.seed(111)
+X <- model.matrix(~ agearr1 + agearr2 + agearr3 + agearr4 + agearr5 + agearr6 + agearr7 + agearr8 + agearr9 + agearr10 + agearr11 + agearr12 + agearr13 + agearr14 + as.factor(age) + female + black + asianpi + other + multi + hispdum + as.factor(bpld), data=indiv)
+
+W <- indiv$eng_binary
+Z <- indiv$idvar
+Y <- indiv$incwage
+
+incwage_iv_forest <- instrumental_forest(
+  X, Y, W, Z, num.trees = 250
+)
+
+incwage_ate <- average_treatment_effect(incwage_iv_forest)
+incwage_ate
+
+incwage_scores <- get_scores(incwage_iv_forest)
+covariate_df <- data.frame(X)
+score_model = lm(incwage_scores ~ ., data=covariate_df)
+summary(score_model)
+```
+
+## DML
+
+```{r}
+set.seed(123)
+data <- as.data.table(indiv)
+y_col <- "incwage"
+d_col <- "eng_binary"
+z_col <- "idvar"
+
+x_cols <- c("agearr1", "agearr2", "agearr3", "agearr4", "agearr5",
+            "agearr6", "agearr7", "agearr8", "agearr9", "agearr10",
+            "agearr11", "agearr12", "agearr13", "agearr14",
+            "female", "black", "asianpi", "other", "multi", "hispdum")
+data[, age := as.factor(age)]
+data[, bpld := as.factor(bpld)]
+x_cols <- c(x_cols, "age", "bpld")
+
+obj_dml_data <- DoubleMLData$new(data, y_col = y_col, d_cols = d_col, z_cols = z_col, x_cols = x_cols)
+
+set.seed(4444)
+ml_g <- lrn("regr.ranger", num.trees = 250, mtry = 20, min.node.size = 2, max.depth = 5) 
+ml_m <- lrn("classif.ranger", num.trees = 250, mtry = 20, min.node.size = 2, max.depth = 5)
+ml_r <- ml_m$clone()
+dml_iivm_obj <- DoubleMLIIVM$new(obj_dml_data, ml_g, ml_m, ml_r)
+
+dml_iivm_obj$fit()
+print(dml_iivm_obj)
+```
+
